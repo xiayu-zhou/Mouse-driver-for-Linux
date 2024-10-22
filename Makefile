@@ -1,7 +1,7 @@
-#KERNEL_DIR=/lib/modules/5.15.0-100-generic/build/
 ARCH_x86_64 := x86_64
 ARCH_arm := arm64
 ARCH=x86_64
+CC = aarch64-linux-gnu-gcc
 $(info ARCH is set to $(ARCH)) 
 ifeq ($(ARCH),$(ARCH_x86_64))
 	KERNEL_DIR=/usr/src/linux-headers-5.15.0-122-generic/
@@ -20,6 +20,8 @@ obj-m := usb_driver.o
 
 all:
 	 $(BUILD_COMMAND) 
+	 $(CC) test_app.c -o test_app	
 .PHONY:clean
 clean:
 	$(MAKE)  -C $(KERNEL_DIR) M=$(CURDIR) clean
+	rm test_app

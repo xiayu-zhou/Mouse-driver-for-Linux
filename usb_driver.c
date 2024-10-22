@@ -2,7 +2,7 @@
  * @Author: Kiana 3151293303@qq.com
  * @Date: 2024-09-15 11:57:33
  * @LastEditors: Kiana 3151293303@qq.com
- * @LastEditTime: 2024-10-17 20:23:55
+ * @LastEditTime: 2024-10-22 15:07:30
  * @FilePath: /zxy/ubuntu/linux_drv/USB_Test/usb_test.c
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
@@ -18,19 +18,20 @@
 #include <linux/device.h>
 #include <linux/hid.h>
 #include <linux/usb.h>
-
+#include <linux/usb/input.h> 
 #define DECICE_NAME "MyUSBHID"
 
 
 #define USB_VENDOR_ID 0x17ef
 #define USB_PRODUCT_ID 0x6019
 
-static int num = 0;
 
-int MaxLen = 0;
-
-static struct urb *uk_urb = NULL; // 指向USB请求块(URB)结构体的指针，用于管理数据传输
-unsigned char *transfer_buffer;
+static int num = 0;					// 计数触发几次
+int MaxLen = 0;						// 最大长度
+static struct urb *uk_urb = NULL; 	// 指向USB请求块(URB)结构体的指针，用于管理数据传输
+unsigned char *transfer_buffer;		// 用于存储从USB设备接收的数据
+static struct input_dev *uk_dev;	// 输入设备结构体
+static dma_addr_t usb_buf_phys; 	// 物理地址，用于DMA传输
 
 
 static struct usb_device_id usb_drv_table[]={
@@ -38,25 +39,28 @@ static struct usb_device_id usb_drv_table[]={
 		// 指定设备
 		USB_DEVICE(USB_VENDOR_ID, USB_PRODUCT_ID)
 	},
-	// {USB_INTERFACE_INFO(USB_INTERFACE_CLASS_HID, USB_INTERFACE_SUBCLASS_BOOT,
-	// 	USB_INTERFACE_PROTOCOL_MOUSE) },
 	{}
 };
 
+/// @brief 鼠标断开连接的触发事件
+/// @param intf 
 void cam_disconnect(struct usb_interface *intf)
 {
-    printk("cam_disconnect %d\n",num++);
+    printk("USB_disconnect %d\n",num++);
 	num = 0;
 }
 
-// URB中断处理函数，用于处理USB鼠标数据
+/// @brief URB中断处理函数，用于处理USB鼠标数据
+/// @param urb 
 static void cam_usb_irq(struct urb *urb)
 {
 	//int ret;  
-	//int i;
+	int i;
     unsigned char *data;  
     struct usb_interface *intf;  
     struct usb_endpoint_descriptor *endpoint;  
+	// 存储上一次的按键状态
+	static unsigned char pre_val; 
   	printk("------------------>usb_irq\n");
     // 检查URB的状态  
     if (urb->status < 0) {  
@@ -71,22 +75,32 @@ static void cam_usb_irq(struct urb *urb)
   
     // 简单的数据处理（这里只是打印数据，实际应用中需要解析数据）  
     printk(KERN_INFO "Received USB mouse data: ");  
-    // for (i = 0; i < urb->actual_length; i++) {  
-    //     printk("%02x ", data[i]);  
-    // }  
-	if(data[0] == 0x1){
-		printk("++++++++++++++++++ left ++++++++++++++++++++++++\n");
-	}else if (data[0] == 0x02)
-	{
-		printk("++++++++++++++++++++ right +++++++++++++++++++++\n");
+    for (i = 0; i < urb->actual_length; i++) {  
+        printk("%02x \n", data[i]);  
+    }  
+	if ((pre_val & (1<<0)) != (data[0] & (1<<0)))
+    {
+		printk("// ***************** BTN_LEFT change ***************** //\n");
+		input_event(uk_dev, EV_KEY, BTN_LEFT, (data[0] & (1 << 0)) ? 1 : 0); // 报告鼠标右键被按下
+		input_sync(uk_dev); // 同步事件，确保上面的事件被处理
 	}
-	
-    printk("\n");  
-  
+
+	if ((pre_val & (1<<1)) != (data[0] & (1<<1)))
+    {
+		printk("// ***************** BTN_RIGHT change ***************** //\n");
+		input_event(uk_dev, EV_KEY, BTN_RIGHT, (data[0] & (1 << 1)) ? 1 : 0); // 报告鼠标右键被按下
+		input_sync(uk_dev); // 同步事件，确保上面的事件被处理
+	}
+
+    pre_val = data[0]; // 更新按键状态
     // 重新提交URB以继续接收数据  
-    usb_submit_urb(urb, GFP_ATOMIC); 
+    usb_submit_urb(uk_urb, GFP_ATOMIC);
 }
 
+/// @brief 
+/// @param intf 
+/// @param id 
+/// @return 
 int cam_drv_probe(struct usb_interface *intf,const struct usb_device_id *id)
 {
 	int ret = 0;
@@ -131,7 +145,8 @@ int cam_drv_probe(struct usb_interface *intf,const struct usb_device_id *id)
 			endpoint->bLength,endpoint->bDescriptorType,endpoint->bEndpointAddress,endpoint->wMaxPacketSize,endpoint->bmAttributes);
 	}
 	// 分配传输缓冲区
-	transfer_buffer = kmalloc(MaxLen, GFP_KERNEL);
+	//transfer_buffer = kmalloc(MaxLen, GFP_KERNEL);
+	transfer_buffer = usb_alloc_coherent(dev, MaxLen, GFP_ATOMIC, &usb_buf_phys);
 
 	if (!transfer_buffer) {  
         printk("Failed to allocate transfer buffer\n");  
@@ -152,6 +167,33 @@ int cam_drv_probe(struct usb_interface *intf,const struct usb_device_id *id)
     // 设置URB  
     usb_fill_int_urb(uk_urb, dev, pipe, transfer_buffer, endpoint->wMaxPacketSize, cam_usb_irq, dev, interval);  
   
+	// ********************************************* input 配置 *********************************************//
+	// 配一个input_dev
+	uk_dev = input_allocate_device();
+
+    //能产生哪类事件
+    set_bit(EV_KEY, uk_dev->evbit); // 支持按键事件
+    set_bit(EV_REP, uk_dev->evbit); // 支持重复事件
+    
+    //能产生哪些按键事件
+    set_bit(BTN_LEFT, uk_dev->keybit); // 支持左键
+    set_bit(BTN_RIGHT, uk_dev->keybit); // 支持右键
+    set_bit(BTN_MIDDLE, uk_dev->keybit); // 支持中键
+
+	set_bit(REL_X, uk_dev->relbit);
+    set_bit(REL_Y, uk_dev->relbit);
+    
+    //注册input_dev
+    ret = input_register_device(uk_dev);
+	
+	printk("input_register_device return : %d\n",ret);
+	// usb_buf = usb_alloc_coherent(dev, MaxLen, GFP_ATOMIC, &usb_buf_phys);
+	
+	// URB 使用 DMA
+	uk_urb->transfer_dma = usb_buf_phys;
+    uk_urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+
+	// ********************************************* URB 注册 *********************************************//
 	// 使用URB  
     ret = usb_submit_urb(uk_urb, GFP_KERNEL);  
     if (ret) {  
@@ -160,11 +202,12 @@ int cam_drv_probe(struct usb_interface *intf,const struct usb_device_id *id)
         kfree(transfer_buffer);  
     } else {  
 		printk("Finish to submit URB: %d\n", ret);  
-    }  
+    }
+
 	return ret;
 }
 
-/* 1. 分配/设置usb_driver */
+/// @brief USB的驱动结构体填写
 static struct usb_driver cam_driver = {
 	.name		= DECICE_NAME,
 	.probe		= cam_drv_probe,
@@ -172,12 +215,14 @@ static struct usb_driver cam_driver = {
 	.id_table	= usb_drv_table,
 };
 
-
+/// @brief 驱动人口函数
+/// @param  
+/// @return 
 static int __init _driver_init(void)
 {
 	int retval = 0;
 	printk("_driver_init \nversion = %d\n",LINUX_VERSION_CODE);//#include <linux/version.h>
-	/* 2. 注册 */
+
 	retval = usb_register(&cam_driver);
 
     printk("Register the usb driver with the usb subsystem retval = %d\n",retval);
@@ -185,6 +230,9 @@ static int __init _driver_init(void)
     return 0;
 }
 
+/// @brief 驱动出口函数
+/// @param  
+/// @return 
 static void __exit _driver_exit(void)
 {
 	printk("Deregister the usb driver with usb subsystem\n");
